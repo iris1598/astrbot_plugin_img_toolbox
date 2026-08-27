@@ -1,0 +1,6 @@
+name: astrbot_plugin_img_toolbox # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
+display_name: 图片工具箱 # 用于展示的名字
+desc: 图片工具箱：GIF 万能工具箱（视频转GIF/合成/变速/倒放/分解/剪裁/做旧/线稿）+ 图像对称镜像（左/右/上/下对称、反色）
+version: v1.0.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+author: shskjw / FenChen0211 # 作者
+repo: https://github.com/iris1598/astrbot_plugin_img_toolbox # 插件的仓库地址

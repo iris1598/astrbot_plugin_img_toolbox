@@ -1,0 +1,551 @@
+"""
+网络请求工具模块
+"""
+
+import aiohttp
+import asyncio
+import socket
+import ipaddress
+from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
+from astrbot.api import logger
+
+
+class FixedDNSResolver:
+    """固定DNS解析器，防止DNS重绑定攻击"""
+
+    def __init__(self, safe_resolutions: Dict[str, str]):
+        """
+        初始化固定DNS解析器
+
+        Args:
+            safe_resolutions: 字典，域名 -> 安全IP的映射
+        """
+        self._safe_resolutions = safe_resolutions
+        self._resolver = aiohttp.resolver.DefaultResolver()
+
+    async def resolve(self, hostname: str, port=0, family=socket.AF_INET):
+        """
+        解析主机名，返回预先验证的安全IP（带地址族验证）
+
+        Args:
+            hostname: 要解析的域名
+            port: 端口
+            family: 地址族（AF_INET 或 AF_INET6）
+
+        Returns:
+            解析结果列表
+        """
+        if hostname in self._safe_resolutions:
+            safe_ip = self._safe_resolutions[hostname]
+
+            # 验证预解析IP的类型是否与请求的地址族兼容
+            try:
+                ip_obj = ipaddress.ip_address(safe_ip)
+            except ValueError:
+                # IP格式无效，返回空列表而不是回退到默认解析器
+                logger.warning(f"无效的预解析IP: {safe_ip}，拒绝解析")
+                return []
+
+            # 检查地址族兼容性
+            if family == socket.AF_INET and ip_obj.version != 4:
+                # 请求IPv4但预解析的是IPv6
+                # 安全修复：地址族不匹配时返回空列表，不回退到默认解析器
+                logger.warning(
+                    f"地址族不匹配: 请求IPv4但 {hostname} 预解析为IPv6 ({safe_ip})，拒绝解析"
+                )
+                return []
+            elif family == socket.AF_INET6 and ip_obj.version != 6:
+                # 请求IPv6但预解析的是IPv4
+                # 安全修复：地址族不匹配时返回空列表，不回退到默认解析器
+                logger.warning(
+                    f"地址族不匹配: 请求IPv6但 {hostname} 预解析为IPv4 ({safe_ip})，拒绝解析"
+                )
+                return []
+
+            # 返回预先验证的安全IP
+            return [
+                {
+                    "hostname": hostname,
+                    "host": safe_ip,
+                    "port": port,
+                    "family": family,
+                    "proto": socket.IPPROTO_TCP,
+                    "flags": socket.AI_NUMERICHOST,
+                }
+            ]
+        # 其他域名使用默认解析器
+        return await self._resolver.resolve(hostname, port, family)
+
+
+class NetworkUtils:
+    """网络请求工具类"""
+
+    # 类常量
+    # 危险域名/地址模式（用于SSRF防护）
+    DANGEROUS_PATTERNS = [
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "169.254.",
+        "metadata.",
+        ".internal",
+        ".local",
+        ".localdomain",
+        # 内网地址段（CIDR表示法，字符串匹配）
+        "10.",
+        "172.16.",
+        "172.17.",
+        "172.18.",
+        "172.19.",
+        "172.20.",
+        "172.21.",
+        "172.22.",
+        "172.23.",
+        "172.24.",
+        "172.25.",
+        "172.26.",
+        "172.27.",
+        "172.28.",
+        "172.29.",
+        "172.30.",
+        "172.31.",
+        "192.168.",
+    ]
+
+    # 重试退避策略（秒）
+    RETRY_BASE_DELAY = 0.5
+    RETRY_MAX_DELAY = 4.0
+
+    # QQ头像API列表（基于QQ号，适用于 aiocqhttp / qq 频道等场景）
+    QQ_AVATAR_APIS = [
+        "https://q1.qlogo.cn/g?b=qq&nk={qq_number}&s={size}",
+        "https://q2.qlogo.cn/headimg_dl?dst_uin={qq_number}&spec={size}",
+        "https://q4.qlogo.cn/headimg_dl?dst_uin={qq_number}&spec={size}",
+        "https://q.qlogo.cn/g?b=qq&nk={qq_number}&s={size}",
+    ]
+
+    # QQ官方机器人头像API模板（基于 AppID + openid，适用于 qqofficial / qqofficial_full 适配器）
+    # 群聊使用 member_openid，C2C 私聊使用 user_openid
+    QQOFFICIAL_AVATAR_URL = "https://q.qlogo.cn/qqapp/{appid}/{openid}/{size}"
+
+    def __init__(self, timeout: int = 30, config=None):
+        self.timeout = timeout
+        self.config = config  # 保存配置引用
+        self._session_lock = asyncio.Lock()  # Session创建锁
+        self._base_session: Optional[aiohttp.ClientSession] = None  # 基础Session（无固定Resolver）
+
+        # 从配置获取大小限制，或使用默认值
+        if config and hasattr(config, "max_image_size_bytes"):
+            self.max_download_size = config.max_image_size_bytes
+        else:
+            self.max_download_size = 10 * 1024 * 1024  # 10MB默认
+
+    async def _get_base_session(self) -> aiohttp.ClientSession:
+        """获取基础Session（用于不需要固定Resolver的请求）"""
+        if self._base_session is None or self._base_session.closed:
+            async with self._session_lock:
+                if self._base_session is None or self._base_session.closed:
+                    timeout = aiohttp.ClientTimeout(total=self.timeout)
+                    self._base_session = aiohttp.ClientSession(timeout=timeout)
+        return self._base_session
+
+    async def cleanup(self):
+        """清理资源"""
+        if self._base_session and not self._base_session.closed:
+            await self._base_session.close()
+        self._base_session = None
+
+    async def _resolve_hostname(self, hostname: str) -> str:
+        """异步解析域名获取IP地址（优先IPv4）"""
+        try:
+            loop = asyncio.get_running_loop()
+
+            # 第一步：优先尝试解析IPv4（HTTP/HTTPS通常使用IPv4）
+            try:
+                addrinfo = await loop.getaddrinfo(
+                    hostname, None, family=socket.AF_INET, type=socket.SOCK_STREAM
+                )
+                if addrinfo:
+                    return addrinfo[0][4][0]
+            except socket.gaierror:
+                pass  # IPv4失败，继续尝试IPv6
+
+            # 第二步：回退到IPv6（仅当IPv4不可用时）
+            try:
+                addrinfo = await loop.getaddrinfo(
+                    hostname, None, family=socket.AF_INET6, type=socket.SOCK_STREAM
+                )
+                if addrinfo:
+                    return addrinfo[0][4][0]
+            except socket.gaierror:
+                pass  # IPv6也失败
+
+            # 第三步：最后尝试任意地址族
+            try:
+                addrinfo = await loop.getaddrinfo(
+                    hostname, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+                )
+                if addrinfo:
+                    # 优先选择IPv4地址
+                    for entry in addrinfo:
+                        ip = entry[4][0]
+                        try:
+                            ip_obj = ipaddress.ip_address(ip)
+                            if ip_obj.version == 4:
+                                return ip
+                        except ValueError:
+                            continue
+                    # 没有IPv4，返回第一个
+                    return addrinfo[0][4][0]
+            except socket.gaierror:
+                pass
+
+        except (socket.gaierror, asyncio.CancelledError, Exception) as e:
+            logger.debug(f"DNS解析失败 {hostname}: {e}")
+
+        return None
+
+    def _is_private_ip(self, ip_str: str) -> bool:
+        """检查IP是否为私有地址"""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            return ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            return False
+
+    def _is_ip_format(self, hostname: str) -> bool:
+        """
+        检查是否为IP格式（支持各种表示法）
+        - IPv4: 192.168.1.1, 127.0.0.1
+        - IPv6: ::1, 2001:db8::1, [::1]
+        - 整数表示: 2130706433 (0x7F000001)
+        """
+        try:
+            # 检查原始字符串
+            ipaddress.ip_address(hostname)
+            return True
+        except ValueError:
+            pass
+
+        # 检测整数格式的IPv4
+        try:
+            ip_int = int(hostname)
+            if 0 <= ip_int <= 0xFFFFFFFF:  # 32位整数范围
+                ipaddress.ip_address(ip_int)
+                return True
+        except (ValueError, ipaddress.AddressValueError):
+            pass
+
+        return False
+
+    def _is_link_local_ip(self, ip_str: str) -> bool:
+        """检查是否为链路本地地址 (169.254.x.x)"""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            return ip.is_link_local
+        except ValueError:
+            return False
+
+    async def _is_safe_url_with_ip(self, url: str) -> Optional[Tuple[str, str]]:
+        """
+        增强版安全URL检查 + DNS解析，返回安全IP和主机名
+
+        改进点：
+        - 对IP格式的URL直接检查，绕过DNS解析
+        - 检测整数格式的IPv4表示（如 2130706433）
+        - 链路本地地址检查 (169.254.x.x)
+
+        Args:
+            url: 完整URL
+
+        Returns:
+            (安全IP, 主机名) 或 None（如果不安全）
+        """
+        try:
+            parsed = urlparse(url)
+
+            # 基础检查
+            if parsed.scheme not in ("http", "https"):
+                return None
+
+            hostname = parsed.hostname
+            if not hostname:
+                return None
+
+            # 1. 如果是IP格式（包含IPv4/IPv6），直接检查
+            if self._is_ip_format(hostname):
+                # 检查是否为私有/本地/链路本地IP
+                if self._is_private_ip(hostname):
+                    logger.warning(f"IP格式危险（私有/回环）: {hostname}")
+                    return None
+                # 对于IP格式，直接返回IP作为主机名
+                return (hostname, hostname)
+
+            # 移除IPv6方括号（如果存在）
+            if hostname.startswith("[") and hostname.endswith("]"):
+                hostname_clean = hostname[1:-1]
+                if self._is_ip_format(hostname_clean):
+                    if self._is_private_ip(hostname_clean):
+                        logger.warning(f"IPv6格式危险: {hostname}")
+                        return None
+                    return (hostname_clean, hostname)
+
+            # 2. 原有字符串检查（黑名单）- 带通配符支持
+            for pattern in self.DANGEROUS_PATTERNS:
+                clean_pattern = pattern[1:] if pattern.startswith(".") else pattern
+                if (
+                    hostname == pattern
+                    or hostname.endswith("." + clean_pattern)
+                    or hostname.startswith(pattern)
+                ):
+                    return None
+
+            # 3. DNS解析并验证IP
+            resolved_ip = await self._resolve_hostname(hostname)
+
+            if not resolved_ip:
+                logger.warning(f"DNS解析失败，拒绝访问: {hostname}")
+                return None
+
+            # IP地址检查
+            if self._is_private_ip(resolved_ip):
+                logger.warning(f"域名解析到私有IP: {hostname} -> {resolved_ip}")
+                return None
+
+            # 返回安全IP和主机名
+            return (resolved_ip, hostname)
+
+        except Exception as e:
+            logger.warning(f"URL安全检查失败 {url}: {e}")
+            return None
+
+    async def get_session(self):
+        """获取或创建HTTP会话（用于不需要固定Resolver的请求）"""
+        return await self._get_base_session()
+
+    async def _is_safe_url(self, url: str) -> bool:
+        """真正的SSRF防护 - 包含DNS解析检查"""
+        try:
+            parsed = urlparse(url)
+
+            # 基础检查
+            if parsed.scheme not in ("http", "https"):
+                return False
+
+            hostname = parsed.hostname
+            if not hostname:
+                return False
+
+            # 1. 快速字符串检查（黑名单）- 使用类常量
+            for pattern in self.DANGEROUS_PATTERNS:
+                # 统一处理：如果pattern以点开头，去掉点
+                clean_pattern = pattern[1:] if pattern.startswith(".") else pattern
+                if (
+                    hostname == pattern
+                    or hostname.endswith("." + clean_pattern)
+                    or hostname.startswith(pattern)
+                ):
+                    return False
+
+            # 2. DNS解析检查（返回带IP的安全检查）
+            safe_info = await self._is_safe_url_with_ip(url)
+            if not safe_info:
+                return False
+
+            return True
+        except Exception as e:
+            logger.warning(f"URL安全检查失败 {url}: {e}")
+            return False
+
+    async def download_image(self, url: str) -> Optional[bytes]:
+        """
+        下载图片（防DNS Rebinding版本 - 使用固定DNS解析器解决SSL证书问题）
+
+        通过自定义DNS解析器将域名固定解析到预先验证的安全IP，
+        保持原始URL进行连接，避免HTTPS证书验证失败。
+
+        设计权衡：
+        为防范DNS Rebinding攻击，每个请求创建独立的ClientSession和FixedDNSResolver。
+        这在安全性上非常出色，但ClientSession创建销毁有开销。
+        高并发场景可考虑：1)维护一个带固定Resolver的连接池；2)或对可信域名跳过此检查。
+        当前实现优先保证安全性。
+
+        Args:
+            url: 图片URL
+
+        Returns:
+            图片字节数据，失败返回None
+        """
+        safe_info = await self._is_safe_url_with_ip(url)
+        if not safe_info:
+            logger.warning(f"拒绝不安全的URL: {url}")
+            return None
+
+        safe_ip, hostname = safe_info
+
+        try:
+            resolver = FixedDNSResolver({hostname: safe_ip})
+            connector = aiohttp.TCPConnector(
+                resolver=resolver,
+                limit_per_host=3,
+                ttl_dns_cache=300,
+            )
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+
+            async with aiohttp.ClientSession(
+                connector=connector, timeout=timeout
+            ) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.error(f"下载失败，状态码: {response.status}")
+                        return None
+
+                    buffer = bytearray()
+                    async for chunk in response.content.iter_chunked(8192):
+                        buffer.extend(chunk)
+                        if len(buffer) > self.max_download_size:
+                            logger.error(f"图片超过大小限制: {len(buffer)} bytes")
+                            return None
+
+                    logger.info(f"成功下载图片，大小: {len(buffer)} bytes")
+                    return bytes(buffer)
+
+        except asyncio.TimeoutError:
+            logger.error(f"下载超时: {url}")
+            return None
+        except Exception as e:
+            logger.error(f"下载图片失败 {url}: {str(e)}")
+            return None
+
+    async def get_qq_avatar(self, qq_number: str, size: int = 640) -> Optional[bytes]:
+        """
+        获取QQ用户头像
+
+        Args:
+            qq_number: QQ号码
+            size: 头像尺寸 (默认640)
+
+        Returns:
+            头像图片字节数据，失败返回None
+        """
+        avatar_urls = [
+            url.format(qq_number=qq_number, size=size)
+            for url in self.QQ_AVATAR_APIS
+        ]
+
+        for url in avatar_urls:
+            try:
+                avatar_data = await self._download_with_retry(url)
+                if avatar_data:
+                    logger.info(f"成功获取QQ头像: {qq_number}")
+                    return avatar_data
+                else:
+                    logger.warning(f"头像API返回空: {url}")
+            except Exception as e:
+                logger.warning(f"头像API异常 {url}: {e}")
+                continue
+
+        logger.error(f"所有头像API都失败: {qq_number}")
+        return None
+
+    async def get_qqofficial_avatar(
+        self, appid: str, openid: str, size: int = 640
+    ) -> Optional[bytes]:
+        """
+        获取QQ官方机器人平台用户头像
+
+        qqofficial / qqofficial_full 适配器无法直接通过 QQ 号取头像，
+        需要使用 AppID + 用户 openid 拼接 q.qlogo.cn/qqapp 接口。
+
+        - 群聊 GroupMessage: openid = member_openid
+        - C2C 私聊 C2CMessage: openid = user_openid
+
+        Args:
+            appid: QQ 机器人 AppID
+            openid: 用户的 member_openid 或 user_openid
+            size: 头像尺寸 (默认640)
+
+        Returns:
+            头像图片字节数据，失败返回None
+        """
+        if not appid or not openid:
+            logger.warning(
+                f"qqofficial头像参数无效: appid={appid!r}, openid={openid!r}"
+            )
+            return None
+
+        # openid 可能是 member_openid 或 user_openid，统一处理
+        url = self.QQOFFICIAL_AVATAR_URL.format(
+            appid=appid, openid=openid, size=size
+        )
+
+        try:
+            avatar_data = await self._download_with_retry(url)
+            if avatar_data:
+                logger.info(
+                    f"成功获取qqofficial头像: openid={openid}, size={size}"
+                )
+                return avatar_data
+            else:
+                logger.warning(
+                    f"qqofficial头像API返回空: {url}"
+                )
+        except Exception as e:
+            logger.warning(f"qqofficial头像API异常 {url}: {e}")
+
+        return None
+
+    async def _download_with_retry(self, url: str, retries: int = 2) -> Optional[bytes]:
+        """
+        带重试的下载（指数退避策略）
+
+        Args:
+            url: 下载地址
+            retries: 重试次数
+
+        Returns:
+            下载的数据
+        """
+        session = await self.get_session()
+        for attempt in range(retries + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+
+                async with session.get(
+                    url, timeout=timeout, headers=headers
+                ) as response:
+                    if response.status == 200:
+                        return await response.read()
+                    elif response.status == 404:
+                        return None
+            except Exception as e:
+                if attempt == retries:
+                    logger.warning(f"下载失败 {url} (尝试{attempt + 1}次): {e}")
+                delay = min(
+                    self.RETRY_BASE_DELAY * (2**attempt), self.RETRY_MAX_DELAY
+                )
+                await asyncio.sleep(delay)
+
+        return None
+
+    async def validate_url(self, url: str) -> bool:
+        """
+        验证URL是否有效
+
+        Args:
+            url: 要验证的URL
+
+        Returns:
+            bool: 是否有效
+        """
+        try:
+            session = await self.get_session()
+            async with session.head(url, timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            return False

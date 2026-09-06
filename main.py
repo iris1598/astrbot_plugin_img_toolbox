@@ -1127,19 +1127,54 @@ class ImgToolboxPlugin(Star):
 
             has_trans = any(f.getchannel("A").getextrema()[0] < 255 for f in frames)
             w, h = frames[0].size
+            transparent_index = 255
+            budget = transparent_index if has_trans else 256
 
-            master = PILImage.new("RGB", (w * min(len(frames), 16), h), (255, 255, 255))
-            for i, f in enumerate(frames[:16]):
-                master.paste(f.convert("RGB"), (i * w, 0))
-            master_pal = master.quantize(colors=255 if has_trans else 256, method=1)
+            # 优先尝试精确调色板: 全动画的不透明颜色数在预算内时无损保留原色
+            exact_map: dict[tuple, int] = {}
+            fits = True
+            for f in frames:
+                frame_colors = f.getcolors(maxcolors=65536)
+                if frame_colors is None or len(exact_map) > budget:
+                    fits = False
+                    break
+                for _, c in frame_colors:
+                    if c[3] >= 128 and c[:3] not in exact_map:
+                        exact_map[c[:3]] = len(exact_map)
+                        if len(exact_map) > budget:
+                            fits = False
+                            break
+                if not fits:
+                    break
 
             gif_frames = []
-            for f in frames:
-                pf = f.convert("RGB").quantize(palette=master_pal)
-                if has_trans:
-                    mask = f.getchannel("A").point(lambda a: 255 if a < 128 else 0)
-                    pf.paste(255, mask=mask)
-                gif_frames.append(pf)
+            if fits:
+                palette = [0, 0, 0] * 256
+                for c, idx in exact_map.items():
+                    palette[idx * 3: idx * 3 + 3] = list(c)
+                for f in frames:
+                    data = [transparent_index if c[3] < 128 else exact_map[c[:3]] for c in f.getdata()]
+                    pf = PILImage.new("P", (w, h))
+                    pf.putdata(data)
+                    pf.putpalette(palette)
+                    if has_trans:
+                        pf.info["transparency"] = transparent_index
+                    gif_frames.append(pf)
+            else:
+                # 颜色数超限的彩色动画: 从全部帧均匀采样构建全局调色板再量化
+                sample_n = min(len(frames), 16)
+                step = max(1, len(frames) // sample_n)
+                sampled = frames[::step][:sample_n]
+                master = PILImage.new("RGB", (w * len(sampled), h), (255, 255, 255))
+                for i, f in enumerate(sampled):
+                    master.paste(f.convert("RGB"), (i * w, 0))
+                master_pal = master.quantize(colors=budget, method=1)
+                for f in frames:
+                    pf = f.convert("RGB").quantize(palette=master_pal)
+                    if has_trans:
+                        mask = f.getchannel("A").point(lambda a: 255 if a < 128 else 0)
+                        pf.paste(transparent_index, mask=mask)
+                    gif_frames.append(pf)
 
             output = io.BytesIO()
             save_kwargs = dict(

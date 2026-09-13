@@ -32,7 +32,6 @@ from PIL import (
     ImageFilter,
     ImageOps,
     ImageEnhance,
-    GifImagePlugin,
 )
 
 from astrbot.api import logger
@@ -51,7 +50,7 @@ except ImportError:
 from .services.config_service import ConfigService
 from .core.image_handler import ImageHandler
 from .utils.message_utils import MessageUtils
-from .image_processor import MirrorProcessor
+from .utils.gif_writer import write_gif_streaming
 
 
 class ImgToolboxPlugin(Star):
@@ -351,17 +350,21 @@ class ImgToolboxPlugin(Star):
     # --- 核心处理逻辑: 视频帧抽帧生成动画 ---
     def _process_gif_core(self, video_path: str, params: dict, max_colors: int = 256):
         try:
-            reader = imageio.get_reader(video_path, format='FFMPEG')
-            meta = reader.get_meta_data()
+            meta_reader = imageio.get_reader(video_path, format='FFMPEG')
+            try:
+                meta = meta_reader.get_meta_data()
+            finally:
+                meta_reader.close()
+
             video_duration = meta.get('duration', 100)
             src_fps = meta.get('fps', 30) or 30
             start_t = params['start']
             end_t = params['end'] if params['end'] is not None else video_duration
             max_dur_conf = self.cfg.get('max_gif_duration', 10.0)
-            warn_msg = ""
+            initial_warn = ""
             if (end_t - start_t) > max_dur_conf:
                 end_t = start_t + max_dur_conf
-                warn_msg = f"(限时{max_dur_conf}s)"
+                initial_warn = f"(限时{max_dur_conf}s)"
             end_t = min(end_t, video_duration)
             if start_t >= video_duration:
                 return None, "❌ 开始时间超限", 0
@@ -380,35 +383,56 @@ class ImgToolboxPlugin(Star):
                 step = 3
                 target_fps = src_fps / step
 
-            frames = []
             output_fmt = self.cfg.get('output_format', 'GIF').upper()
-            for i, frame in enumerate(reader):
-                current_time = i / src_fps
-                if current_time < start_t:
-                    continue
-                if current_time > end_t:
-                    break
-                if i % step == 0:
-                    pil_img = PILImage.fromarray(frame)
-                    w, h = pil_img.size
-                    new_w = int(w * params['scale'])
-                    new_h = int(h * params['scale'])
-                    pil_img = pil_img.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
-                    if output_fmt == 'GIF' and max_colors < 256:
-                        pil_img = pil_img.quantize(colors=max_colors, method=1, dither=PILImage.Dither.FLOYDSTEINBERG)
-                    frames.append(pil_img)
-                if len(frames) > 400:
-                    warn_msg += " [帧数截断]"
-                    break
-            reader.close()
-            if not frames:
-                return None, "❌ 无有效帧", 0
-            output = io.BytesIO()
             duration_ms = int(1000 / target_fps) if target_fps > 0 else 100
-            self._save_animation(output, frames, duration_ms, loop=0)
+            state = {"w": 0, "h": 0, "warn": initial_warn}
+
+            def frame_iter():
+                # 每次调用都重新打开 reader，便于回退时重新遍历
+                state["w"] = state["h"] = 0
+                state["warn"] = initial_warn
+                count = 0
+                reader = imageio.get_reader(video_path, format='FFMPEG')
+                try:
+                    for i, frame in enumerate(reader):
+                        current_time = i / src_fps
+                        if current_time < start_t:
+                            continue
+                        if current_time > end_t:
+                            break
+                        if i % step == 0:
+                            pil_img = PILImage.fromarray(frame)
+                            w, h = pil_img.size
+                            state["w"], state["h"] = w, h
+                            new_w = int(w * params['scale'])
+                            new_h = int(h * params['scale'])
+                            pil_img = pil_img.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
+                            if output_fmt == 'GIF' and max_colors < 256:
+                                pil_img = pil_img.quantize(
+                                    colors=max_colors, method=1,
+                                    dither=PILImage.Dither.FLOYDSTEINBERG,
+                                )
+                            count += 1
+                            yield pil_img, duration_ms
+                            if count > 400:
+                                state["warn"] += " [帧数截断]"
+                                break
+                finally:
+                    reader.close()
+
+            output = io.BytesIO()
+            written = self._write_gif_output(
+                output, frame_iter, loop=0, reserve_transparency=False
+            )
+            if written == 0:
+                return None, "❌ 无有效帧", 0
             output.seek(0)
             size_mb = output.getbuffer().nbytes / 1024 / 1024
-            info = f"时间:{start_t}-{end_t:.1f}s {warn_msg}\n格式:{output_fmt} | FPS:{target_fps:.1f}\n缩放:{params['scale']} | 体积:{size_mb:.2f}MB"
+            info = (
+                f"时间:{start_t}-{end_t:.1f}s {state['warn']}\n"
+                f"格式:{output_fmt} | FPS:{target_fps:.1f}\n"
+                f"缩放:{params['scale']} | 体积:{size_mb:.2f}MB"
+            )
             return output, info, size_mb
         except Exception as e:
             return None, f"内部错误: {repr(e)}", 0
@@ -692,12 +716,16 @@ class ImgToolboxPlugin(Star):
             cw, ch = w // cols, h // rows
             if cw < 2 or ch < 2:
                 return f"⚠️ 单格太小 ({cw}x{ch})", None
-            frames = []
-            for r in range(rows):
-                for c in range(cols):
-                    frames.append(img.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch)))
+
+            duration_ms = int(duration_sec * 1000)
+
+            def frame_iter():
+                for r in range(rows):
+                    for c in range(cols):
+                        yield img.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch)), duration_ms
+
             output = io.BytesIO()
-            self._save_animation(output, frames, int(duration_sec * 1000), loop=0)
+            self._write_gif_output(output, frame_iter, loop=0)
             output.seek(0)
             return f"✅ 合成成功\n算法1 | {w}x{h} | {rows}行{cols}列", output
         except Exception as e:
@@ -709,32 +737,38 @@ class ImgToolboxPlugin(Star):
             if getattr(img, "is_animated", False):
                 img.seek(0)
             img = img.convert("RGBA")
-            datas = img.getdata()
-            new_data = [(0, 0, 0, 0) if item[3] < 128 else (item[0], item[1], item[2], 255) for item in datas]
-            img.putdata(new_data)
-            has_trans = any(d[3] == 0 for d in new_data)
+
+            # 等价于逐像素处理：alpha<128 的像素置为透明黑，其余置为完全不透明
+            alpha = img.getchannel("A")
+            has_trans = alpha.getextrema()[0] < 128
+            if has_trans:
+                trans_mask = alpha.point(lambda a: 255 if a < 128 else 0)
+                base = img.convert("RGB")
+                base.paste((0, 0, 0), (0, 0), trans_mask)
+                img = base.convert("RGBA")
+            img.putalpha(alpha.point(lambda a: 0 if a < 128 else 255))
+
             master_pal = img.convert("RGB").quantize(colors=255 if has_trans else 256, method=1)
             w, h = img.size
             cw, ch = w // cols, h // rows
             if cw < 2 or ch < 2:
                 return f"⚠️ 单格太小 ({cw}x{ch})", None
-            frames = []
-            for r in range(rows):
-                for c in range(cols):
-                    crop = img.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch))
-                    frame = crop.convert("RGB").quantize(palette=master_pal)
-                    if has_trans:
-                        mask = crop.split()[3].point(lambda a: 255 if a < 128 else 0)
-                        frame.paste(255, mask=mask)
-                    frames.append(frame)
+
+            duration_ms = int(duration_sec * 1000)
+
+            def frame_iter():
+                for r in range(rows):
+                    for c in range(cols):
+                        crop = img.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch))
+                        frame = crop.convert("RGB").quantize(palette=master_pal)
+                        if has_trans:
+                            mask = crop.split()[3].point(lambda a: 255 if a < 128 else 0)
+                            frame.paste(255, mask=mask)
+                            frame.info["transparency"] = 255
+                        yield frame, duration_ms
+
             output = io.BytesIO()
-            fmt = self.cfg.get('output_format', 'GIF').upper()
-            if fmt == 'GIF':
-                frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:],
-                               duration=int(duration_sec * 1000), loop=0, disposal=2,
-                               transparency=255 if has_trans else None, optimize=True)
-            else:
-                self._save_animation(output, frames, int(duration_sec * 1000), loop=0)
+            self._write_gif_output(output, frame_iter, loop=0)
             output.seek(0)
             return f"✅ 合成成功\n算法2 | {w}x{h} | {rows}行{cols}列", output
         except Exception as e:
@@ -900,14 +934,7 @@ class ImgToolboxPlugin(Star):
 
                     new_durations = [MIN_DURATION_MS] * len(new_frames)
 
-                    output = io.BytesIO()
-                    new_frames[0].save(
-                        output, format='GIF', save_all=True,
-                        append_images=new_frames[1:],
-                        duration=new_durations, loop=0,
-                        disposal=2, optimize=True
-                    )
-                    output.seek(0)
+                    output = self._emit_frames(new_frames, new_durations, loop=0, fmt='GIF')
 
                     msg = (f"✅ 变速完成\n"
                            f"目标: {target_fps:.0f}fps | 原始: {orig_fps:.1f}fps\n"
@@ -917,14 +944,7 @@ class ImgToolboxPlugin(Star):
                     target_duration = int(1000.0 / target_fps)
                     new_durations = [target_duration] * len(frames)
 
-                    output = io.BytesIO()
-                    frames[0].save(
-                        output, format='GIF', save_all=True,
-                        append_images=frames[1:],
-                        duration=new_durations, loop=0,
-                        disposal=2, optimize=True
-                    )
-                    output.seek(0)
+                    output = self._emit_frames(frames, new_durations, loop=0, fmt='GIF')
 
                     msg = f"✅ 变速完成\n目标: {target_fps:.0f}fps | 原始: {orig_fps:.1f}fps"
                     return msg, output
@@ -952,14 +972,7 @@ class ImgToolboxPlugin(Star):
 
                     new_durations = [MIN_DURATION_MS] * len(new_frames)
 
-                    output = io.BytesIO()
-                    new_frames[0].save(
-                        output, format='GIF', save_all=True,
-                        append_images=new_frames[1:],
-                        duration=new_durations, loop=0,
-                        disposal=2, optimize=True
-                    )
-                    output.seek(0)
+                    output = self._emit_frames(new_frames, new_durations, loop=0, fmt='GIF')
 
                     effective_fps = 1000.0 / MIN_DURATION_MS
                     action = "加速" if speed_factor > 1 else ("减速" if speed_factor < 1 else "")
@@ -969,14 +982,7 @@ class ImgToolboxPlugin(Star):
                 else:
                     new_durations = raw_durations
 
-                    output = io.BytesIO()
-                    frames[0].save(
-                        output, format='GIF', save_all=True,
-                        append_images=frames[1:],
-                        duration=new_durations, loop=0,
-                        disposal=2, optimize=True
-                    )
-                    output.seek(0)
+                    output = self._emit_frames(frames, new_durations, loop=0, fmt='GIF')
 
                     effective_fps = 1000.0 / (sum(new_durations) / len(new_durations))
                     action = "加速" if speed_factor > 1 else ("减速" if speed_factor < 1 else "")
@@ -1154,12 +1160,14 @@ class ImgToolboxPlugin(Star):
                 palette = [0, 0, 0] * 256
                 for c, idx in exact_map.items():
                     palette[idx * 3: idx * 3 + 3] = list(c)
+                # 用调色板图像做精确映射，替换逐像素 Python 循环
+                pal_img = PILImage.new("P", (1, 1))
+                pal_img.putpalette(palette)
                 for f in frames:
-                    data = [transparent_index if c[3] < 128 else exact_map[c[:3]] for c in f.getdata()]
-                    pf = PILImage.new("P", (w, h))
-                    pf.putdata(data)
-                    pf.putpalette(palette)
+                    pf = f.convert("RGB").quantize(palette=pal_img, dither=PILImage.Dither.NONE)
                     if has_trans:
+                        mask = f.getchannel("A").point(lambda a: 255 if a < 128 else 0)
+                        pf.paste(transparent_index, mask=mask)
                         pf.info["transparency"] = transparent_index
                     gif_frames.append(pf)
             else:
@@ -1176,21 +1184,10 @@ class ImgToolboxPlugin(Star):
                     if has_trans:
                         mask = f.getchannel("A").point(lambda a: 255 if a < 128 else 0)
                         pf.paste(transparent_index, mask=mask)
+                        pf.info["transparency"] = transparent_index
                     gif_frames.append(pf)
 
-            output = io.BytesIO()
-            save_kwargs = dict(
-                format='GIF', save_all=True,
-                append_images=gif_frames[1:],
-                duration=durations, loop=0,
-                disposal=2,
-                optimize=not has_trans,
-            )
-            if has_trans:
-                save_kwargs['transparency'] = 255
-                save_kwargs['background'] = 255
-            gif_frames[0].save(output, **save_kwargs)
-            output.seek(0)
+            output = self._emit_frames(gif_frames, durations, loop=0, fmt='GIF')
             total_ms = sum(durations)
             return f"✅ 倒放完成 ({len(frames)}帧, 时长{total_ms / 1000:.2f}s)", output
         except Exception as e:
@@ -1220,56 +1217,68 @@ class ImgToolboxPlugin(Star):
         bg.paste(img_resized, ((canvas_w - new_w) // 2, (canvas_h - new_h) // 2), mask=img_resized)
         return bg
 
-    def _write_gif_streaming(self, output: io.BytesIO, frames, loop: int = 0) -> int:
+    def _gif_palette_colors(self) -> int:
+        """读取 GIF 量化颜色数配置，限制在 2-256。"""
+        try:
+            value = int(self.cfg.get('gif_max_colors', 256) or 256)
+        except (TypeError, ValueError):
+            return 256
+        return max(2, min(256, value))
+
+    def _write_gif_output(self, output: io.BytesIO, frames_factory, loop: int = 0, palette_colors: int = None, reserve_transparency: bool = True, fmt: str = None) -> int:
         """
-        流式写出 GIF：逐帧量化并立即写入，任意时刻只保留当前帧。
+        写出动图：GIF 优先走流式写入（内存占用与帧数无关），否则回退标准写出。
 
-        Pillow 的 save(save_all=True) 会把所有帧先缓存到内存再写，帧数多时极易
-        撑爆内存；这里直接复用 Pillow 的底层帧写入原语，做到内存占用与帧数无关。
-        frames 为可迭代对象，逐项产出 (RGBA 图像, 时长 ms)。
-
-        返回写入的帧数；若当前 Pillow 版本不提供所需底层接口则返回 -1，由调用方回退。
+        frames_factory 为无参可调用对象，每次调用都返回一个全新的 (帧, 时长ms) 迭代器，
+        以便在流式写入不可用/失败时重新遍历回退。
+        fmt 为空时读取 output_format 配置。
+        返回写入的帧数。
         """
-        if not (
-            hasattr(GifImagePlugin, "_get_global_header")
-            and hasattr(GifImagePlugin, "_write_frame_data")
-        ):
-            return -1
+        fmt = (fmt or self.cfg.get('output_format', 'GIF')).upper()
+        if palette_colors is None:
+            palette_colors = self._gif_palette_colors()
 
-        palette_colors = int(self.cfg.get('gif_max_colors', 256) or 256)
-        transparent_index = MirrorProcessor.GIF_TRANSPARENT_INDEX
-        header_written = False
-        count = 0
+        if fmt == 'GIF':
+            try:
+                count = write_gif_streaming(
+                    output,
+                    frames_factory(),
+                    loop=loop,
+                    palette_colors=palette_colors,
+                    reserve_transparency=reserve_transparency,
+                )
+                if count >= 0:
+                    return count
+            except Exception as e:
+                logger.warning(f"流式写出 GIF 失败，回退标准写出: {type(e).__name__}: {e}")
+                output.seek(0)
+                output.truncate(0)
 
-        for image, duration_ms in frames:
-            p_frame = MirrorProcessor._rgba_to_gif_frame(image, palette_colors, True)
-            if not header_written:
-                info = {
-                    "loop": loop,
-                    "duration": duration_ms,
-                    "transparency": transparent_index,
-                }
-                for chunk in GifImagePlugin._get_global_header(p_frame, info):
-                    output.write(chunk)
-                header_written = True
-            params = {
-                "duration": duration_ms,
-                "disposal": 2,
-                "transparency": transparent_index,
-                "include_color_table": True,
-            }
-            GifImagePlugin._write_frame_data(output, p_frame, (0, 0), params)
-            count += 1
+        frames = []
+        durations = []
+        for frame, dur in frames_factory():
+            frames.append(frame)
+            durations.append(dur)
+        if frames:
+            self._save_animation(output, frames, durations, loop=loop)
+        return len(frames)
 
-        if not header_written:
-            return 0
-        output.write(b";")
-        return count
+    def _emit_frames(self, frames_list, durations_list, loop: int = 0, fmt: str = None, reserve_transparency: bool = True) -> io.BytesIO:
+        """把已构造好的帧列表走统一写出路径（GIF 流式优先），返回 BytesIO。"""
+        output = io.BytesIO()
+        self._write_gif_output(
+            output,
+            lambda: ((f, d) for f, d in zip(frames_list, durations_list)),
+            loop=loop,
+            reserve_transparency=reserve_transparency,
+            fmt=fmt,
+        )
+        output.seek(0)
+        return output
 
     def _worker_multi_image_gif(self, images_bytes: list[bytes], duration_sec: float):
         try:
             default_ms = max(1, int(duration_sec * 1000))
-            fmt = self.cfg.get('output_format', 'GIF').upper()
 
             # 第一遍只读图片头获取尺寸用于确定画布大小（Image.open 惰性解码，不读像素）
             canvas_w = canvas_h = 0
@@ -1306,27 +1315,8 @@ class ImgToolboxPlugin(Star):
                         yield self._compose_on_canvas(frame.convert("RGBA"), canvas_w, canvas_h), int(dur)
 
             output = io.BytesIO()
-            count = -1
-            if fmt == 'GIF':
-                try:
-                    count = self._write_gif_streaming(output, iter_composed_frames())
-                except Exception as e:
-                    logger.warning(f"流式写出 GIF 失败，回退标准写出: {type(e).__name__}: {e}")
-                    count = -1
-
-            if count < 0:
-                # 回退路径：APNG/WEBP 输出或底层接口不可用时，仍逐帧合成但用标准 API 写出
-                output = io.BytesIO()
-                frames = []
-                durations = []
-                for composed, dur in iter_composed_frames():
-                    frames.append(composed)
-                    durations.append(dur)
-                if not frames:
-                    return "❌ 没有有效的图片", None
-                self._save_animation(output, frames, durations, loop=0)
-                count = len(frames)
-            elif count == 0:
+            count = self._write_gif_output(output, iter_composed_frames, loop=0)
+            if count == 0:
                 return "❌ 没有有效的图片", None
 
             output.seek(0)
@@ -1343,39 +1333,21 @@ class ImgToolboxPlugin(Star):
             is_animated = getattr(img, "is_animated", False)
 
             if is_animated:
-                frames = []
-                durations = []
-
-                for frame in ImageSequence.Iterator(img):
-                    dur = frame.info.get('duration', 100)
-                    if dur <= 0:
-                        dur = 100
-                    durations.append(dur)
-                    frame_copy = frame.copy().convert("RGB")
-                    aged_frame = self._age_single_frame(frame_copy, times)
-                    frames.append(aged_frame)
-
-                if not frames:
-                    return "❌ 无法读取动图帧", None
-
-                gif_frames = []
-                for f in frames:
-                    p_frame = f.convert("P", palette=PILImage.Palette.ADAPTIVE, colors=256)
-                    gif_frames.append(p_frame)
+                def frame_iter():
+                    # 逐帧做旧并量化，产出后即可回收，内存占用与帧数无关
+                    for frame in ImageSequence.Iterator(img):
+                        dur = frame.info.get('duration', 100)
+                        if dur <= 0:
+                            dur = 100
+                        aged_frame = self._age_single_frame(frame.copy().convert("RGB"), times)
+                        yield aged_frame.convert("P", palette=PILImage.Palette.ADAPTIVE, colors=256), dur
 
                 output = io.BytesIO()
-                gif_frames[0].save(
-                    output,
-                    format='GIF',
-                    save_all=True,
-                    append_images=gif_frames[1:],
-                    duration=durations,
-                    loop=0,
-                    disposal=2,
-                    optimize=False
-                )
+                count = self._write_gif_output(output, frame_iter, loop=0, fmt='GIF')
+                if count == 0:
+                    return "❌ 无法读取动图帧", None
                 output.seek(0)
-                return f"✅ 做旧成功 (动图 {len(frames)}帧, {times}次传播)", output.getvalue()
+                return f"✅ 做旧成功 (动图 {count}帧, {times}次传播)", output.getvalue()
             else:
                 img = img.convert("RGB")
                 aged_img = self._age_single_frame(img, times)

@@ -1200,6 +1200,10 @@ class ImgToolboxPlugin(Star):
     @staticmethod
     def _compose_on_canvas(rgba: PILImage.Image, canvas_w: int, canvas_h: int) -> PILImage.Image:
         """把单帧等比缩放后居中粘贴到透明画布上。"""
+        # 尺寸已与画布一致时无需缩放/居中，也不会有透明留白，直接复用
+        if rgba.width == canvas_w and rgba.height == canvas_h:
+            return rgba
+
         bg = PILImage.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
 
         src_ratio = rgba.width / rgba.height

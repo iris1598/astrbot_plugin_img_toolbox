@@ -579,13 +579,9 @@ class MirrorProcessor:
         p_frame.putpalette(palette)
 
         if has_alpha:
-            mask = Image.eval(alpha, lambda a: 255 if a < 128 else 0)
-            p_data = list(p_frame.getdata())
-            mask_data = list(mask.getdata())
-            for i, mask_value in enumerate(mask_data):
-                if mask_value:
-                    p_data[i] = transparent_index
-            p_frame.putdata(p_data)
+            # 用 C 层的 paste(mask) 一次性写入透明索引，避免逐像素 Python 循环
+            mask = alpha.point(lambda a: 255 if a < 128 else 0)
+            p_frame.paste(transparent_index, (0, 0), mask)
 
         p_frame.info["transparency"] = transparent_index
         return p_frame

@@ -122,19 +122,19 @@ class ImgToolboxPlugin(Star):
     # 二、GIF 核心工具
     # ============================================================
 
-    def _save_animation(self, output: io.BytesIO, frames: list, duration_ms: int, loop: int = 0):
+    def _save_animation(self, output: io.BytesIO, frames: list, duration, loop: int = 0):
         fmt = self.cfg.get('output_format', 'GIF').upper()
         if fmt == 'GIF':
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms,
+            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration,
                            loop=loop, optimize=True, disposal=2)
         elif fmt == 'APNG':
-            frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration_ms,
+            frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration,
                            loop=loop, optimize=True, default_image=True)
         elif fmt == 'WEBP':
-            frames[0].save(output, format='WEBP', save_all=True, append_images=frames[1:], duration=duration_ms,
+            frames[0].save(output, format='WEBP', save_all=True, append_images=frames[1:], duration=duration,
                            loop=loop, method=3, quality=80)
         else:
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms,
+            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration,
                            loop=loop, optimize=True, disposal=2)
 
     # --- 辅助方法: 获取单张图片URL (增强版) ---
@@ -1197,52 +1197,76 @@ class ImgToolboxPlugin(Star):
     # --- 多图合成 GIF 核心处理逻辑 ---
     def _worker_multi_image_gif(self, images_bytes: list[bytes], duration_sec: float):
         try:
-            pil_images = []
+            default_ms = max(1, int(duration_sec * 1000))
+            max_frames = self.cfg.get('max_gif_frames', 200)
+
+            # 每张源图片展开为若干帧（动图展开全部帧，静态图仅一帧），并记录各自时长
+            frame_groups = []
             max_w, max_h = 0, 0
 
             for b in images_bytes:
                 try:
-                    img = PILImage.open(io.BytesIO(b)).convert("RGBA")
-                    if getattr(img, "is_animated", False):
-                        img.seek(0)
-                        img = img.copy()
-                    pil_images.append(img)
-                    max_w = max(max_w, img.width)
-                    max_h = max(max_h, img.height)
+                    img = PILImage.open(io.BytesIO(b))
                 except Exception as e:
                     logger.warning(f"加载图片失败: {e}")
+                    continue
 
-            if not pil_images:
+                group_frames = []
+                group_durations = []
+                if getattr(img, "is_animated", False):
+                    for frame in ImageSequence.Iterator(img):
+                        dur = frame.info.get('duration', 0)
+                        if not dur or dur <= 0:
+                            dur = default_ms
+                        group_frames.append(frame.convert("RGBA"))
+                        group_durations.append(int(dur))
+                        if len(group_frames) >= max_frames:
+                            break
+                else:
+                    group_frames.append(img.convert("RGBA"))
+                    group_durations.append(default_ms)
+
+                if not group_frames:
+                    continue
+
+                for f in group_frames:
+                    max_w = max(max_w, f.width)
+                    max_h = max(max_h, f.height)
+                frame_groups.append((group_frames, group_durations))
+
+            if not frame_groups:
                 return "❌ 没有有效的图片", None
 
             frames = []
-            for img in pil_images:
-                bg = PILImage.new("RGBA", (max_w, max_h), (255, 255, 255, 0))
+            durations = []
+            for group_frames, group_durations in frame_groups:
+                for img in group_frames:
+                    bg = PILImage.new("RGBA", (max_w, max_h), (255, 255, 255, 0))
 
-                src_ratio = img.width / img.height
-                tgt_ratio = max_w / max_h
+                    src_ratio = img.width / img.height
+                    tgt_ratio = max_w / max_h
 
-                if src_ratio > tgt_ratio:
-                    new_w = max_w
-                    new_h = int(max_w / src_ratio)
-                else:
-                    new_h = max_h
-                    new_w = int(max_h * src_ratio)
+                    if src_ratio > tgt_ratio:
+                        new_w = max_w
+                        new_h = int(max_w / src_ratio)
+                    else:
+                        new_h = max_h
+                        new_w = int(max_h * src_ratio)
 
-                img_resized = img.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
+                    img_resized = img.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
 
-                paste_x = (max_w - new_w) // 2
-                paste_y = (max_h - new_h) // 2
-                bg.paste(img_resized, (paste_x, paste_y), mask=img_resized if 'A' in img_resized.getbands() else None)
+                    paste_x = (max_w - new_w) // 2
+                    paste_y = (max_h - new_h) // 2
+                    bg.paste(img_resized, (paste_x, paste_y), mask=img_resized if 'A' in img_resized.getbands() else None)
 
-                frames.append(bg)
+                    frames.append(bg)
+                durations.extend(group_durations)
 
             output = io.BytesIO()
-            duration_ms = int(duration_sec * 1000)
-            self._save_animation(output, frames, duration_ms, loop=0)
+            self._save_animation(output, frames, durations, loop=0)
             output.seek(0)
 
-            return f"✅ 合成成功 ({len(frames)}张)", output
+            return f"✅ 合成成功 ({len(frames)}帧 / {len(frame_groups)}张图)", output
 
         except Exception as e:
             return f"合成出错: {repr(e)}", None
@@ -1423,14 +1447,15 @@ class ImgToolboxPlugin(Star):
             if not await self._emit_text(event, res_msg, stop=True):
                 yield event.plain_result(res_msg)
 
-    @filter.command("多图合成gif")
+    @filter.command("gif合成")
     async def multi_img_gif(self, event: AstrMessageEvent):
         """
         多图合成GIF，支持直接发送图片、回复含图消息、转发消息。
-        用法：多图合成gif [速度/时长]
-        示例：多图合成gif 0.5 (每帧0.5秒)
+        若其中包含 GIF 动图，会展开其所有帧一并合成。
+        用法：gif合成 [每帧秒数]
+        示例：gif合成 0.5 (静态图每帧0.5秒；动图保留原帧时长)
         """
-        msg_text = event.message_str.replace("多图合成gif", "")
+        msg_text = event.message_str.replace("gif合成", "")
         duration = 0.5  # 默认0.5秒
 
         fps_match = re.search(r'(\d+)\s*(?:fps|帧)', msg_text, re.I)

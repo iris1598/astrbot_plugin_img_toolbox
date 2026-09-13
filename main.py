@@ -32,6 +32,7 @@ from PIL import (
     ImageFilter,
     ImageOps,
     ImageEnhance,
+    GifImagePlugin,
 )
 
 from astrbot.api import logger
@@ -50,6 +51,7 @@ except ImportError:
 from .services.config_service import ConfigService
 from .core.image_handler import ImageHandler
 from .utils.message_utils import MessageUtils
+from .image_processor import MirrorProcessor
 
 
 class ImgToolboxPlugin(Star):
@@ -1195,78 +1197,136 @@ class ImgToolboxPlugin(Star):
             return f"❌ 出错: {e}", None
 
     # --- 多图合成 GIF 核心处理逻辑 ---
+    @staticmethod
+    def _compose_on_canvas(rgba: PILImage.Image, canvas_w: int, canvas_h: int) -> PILImage.Image:
+        """把单帧等比缩放后居中粘贴到透明画布上。"""
+        bg = PILImage.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
+
+        src_ratio = rgba.width / rgba.height
+        tgt_ratio = canvas_w / canvas_h
+
+        if src_ratio > tgt_ratio:
+            new_w = canvas_w
+            new_h = max(1, int(canvas_w / src_ratio))
+        else:
+            new_h = canvas_h
+            new_w = max(1, int(canvas_h * src_ratio))
+
+        img_resized = rgba.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
+        bg.paste(img_resized, ((canvas_w - new_w) // 2, (canvas_h - new_h) // 2), mask=img_resized)
+        return bg
+
+    def _write_gif_streaming(self, output: io.BytesIO, frames, loop: int = 0) -> int:
+        """
+        流式写出 GIF：逐帧量化并立即写入，任意时刻只保留当前帧。
+
+        Pillow 的 save(save_all=True) 会把所有帧先缓存到内存再写，帧数多时极易
+        撑爆内存；这里直接复用 Pillow 的底层帧写入原语，做到内存占用与帧数无关。
+        frames 为可迭代对象，逐项产出 (RGBA 图像, 时长 ms)。
+
+        返回写入的帧数；若当前 Pillow 版本不提供所需底层接口则返回 -1，由调用方回退。
+        """
+        if not (
+            hasattr(GifImagePlugin, "_get_global_header")
+            and hasattr(GifImagePlugin, "_write_frame_data")
+        ):
+            return -1
+
+        palette_colors = int(self.cfg.get('gif_max_colors', 256) or 256)
+        transparent_index = MirrorProcessor.GIF_TRANSPARENT_INDEX
+        header_written = False
+        count = 0
+
+        for image, duration_ms in frames:
+            p_frame = MirrorProcessor._rgba_to_gif_frame(image, palette_colors, True)
+            if not header_written:
+                info = {
+                    "loop": loop,
+                    "duration": duration_ms,
+                    "transparency": transparent_index,
+                }
+                for chunk in GifImagePlugin._get_global_header(p_frame, info):
+                    output.write(chunk)
+                header_written = True
+            params = {
+                "duration": duration_ms,
+                "disposal": 2,
+                "transparency": transparent_index,
+                "include_color_table": True,
+            }
+            GifImagePlugin._write_frame_data(output, p_frame, (0, 0), params)
+            count += 1
+
+        if not header_written:
+            return 0
+        output.write(b";")
+        return count
+
     def _worker_multi_image_gif(self, images_bytes: list[bytes], duration_sec: float):
         try:
             default_ms = max(1, int(duration_sec * 1000))
-            max_frames = self.cfg.get('max_gif_frames', 200)
+            fmt = self.cfg.get('output_format', 'GIF').upper()
 
-            # 每张源图片展开为若干帧（动图展开全部帧，静态图仅一帧），并记录各自时长
-            frame_groups = []
-            max_w, max_h = 0, 0
-
+            # 第一遍只读图片头获取尺寸用于确定画布大小（Image.open 惰性解码，不读像素）
+            canvas_w = canvas_h = 0
             for b in images_bytes:
                 try:
-                    img = PILImage.open(io.BytesIO(b))
+                    with PILImage.open(io.BytesIO(b)) as probe:
+                        w, h = probe.size
                 except Exception as e:
                     logger.warning(f"加载图片失败: {e}")
                     continue
+                if w > 0 and h > 0:
+                    canvas_w = max(canvas_w, w)
+                    canvas_h = max(canvas_h, h)
 
-                group_frames = []
-                group_durations = []
-                if getattr(img, "is_animated", False):
-                    for frame in ImageSequence.Iterator(img):
-                        dur = frame.info.get('duration', 0)
-                        if not dur or dur <= 0:
-                            dur = default_ms
-                        group_frames.append(frame.convert("RGBA"))
-                        group_durations.append(int(dur))
-                        if len(group_frames) >= max_frames:
-                            break
-                else:
-                    group_frames.append(img.convert("RGBA"))
-                    group_durations.append(default_ms)
-
-                if not group_frames:
-                    continue
-
-                for f in group_frames:
-                    max_w = max(max_w, f.width)
-                    max_h = max(max_h, f.height)
-                frame_groups.append((group_frames, group_durations))
-
-            if not frame_groups:
+            if canvas_w <= 0 or canvas_h <= 0:
                 return "❌ 没有有效的图片", None
 
-            frames = []
-            durations = []
-            for group_frames, group_durations in frame_groups:
-                for img in group_frames:
-                    bg = PILImage.new("RGBA", (max_w, max_h), (255, 255, 255, 0))
+            def iter_composed_frames():
+                # 逐张源图、逐帧合成；动图展开全部帧，产出后即可被回收
+                for b in images_bytes:
+                    try:
+                        img = PILImage.open(io.BytesIO(b))
+                    except Exception as e:
+                        logger.warning(f"加载图片失败: {e}")
+                        continue
 
-                    src_ratio = img.width / img.height
-                    tgt_ratio = max_w / max_h
+                    animated = getattr(img, "is_animated", False)
+                    source_frames = ImageSequence.Iterator(img) if animated else (img,)
 
-                    if src_ratio > tgt_ratio:
-                        new_w = max_w
-                        new_h = int(max_w / src_ratio)
-                    else:
-                        new_h = max_h
-                        new_w = int(max_h * src_ratio)
-
-                    img_resized = img.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
-
-                    paste_x = (max_w - new_w) // 2
-                    paste_y = (max_h - new_h) // 2
-                    bg.paste(img_resized, (paste_x, paste_y), mask=img_resized if 'A' in img_resized.getbands() else None)
-
-                    frames.append(bg)
-                durations.extend(group_durations)
+                    for frame in source_frames:
+                        dur = frame.info.get('duration', 0) if animated else default_ms
+                        if not dur or dur <= 0:
+                            dur = default_ms
+                        yield self._compose_on_canvas(frame.convert("RGBA"), canvas_w, canvas_h), int(dur)
 
             output = io.BytesIO()
-            self._save_animation(output, frames, durations, loop=0)
-            output.seek(0)
+            count = -1
+            if fmt == 'GIF':
+                try:
+                    count = self._write_gif_streaming(output, iter_composed_frames())
+                except Exception as e:
+                    logger.warning(f"流式写出 GIF 失败，回退标准写出: {type(e).__name__}: {e}")
+                    count = -1
 
-            return f"✅ 合成成功 ({len(frames)}帧 / {len(frame_groups)}张图)", output
+            if count < 0:
+                # 回退路径：APNG/WEBP 输出或底层接口不可用时，仍逐帧合成但用标准 API 写出
+                output = io.BytesIO()
+                frames = []
+                durations = []
+                for composed, dur in iter_composed_frames():
+                    frames.append(composed)
+                    durations.append(dur)
+                if not frames:
+                    return "❌ 没有有效的图片", None
+                self._save_animation(output, frames, durations, loop=0)
+                count = len(frames)
+            elif count == 0:
+                return "❌ 没有有效的图片", None
+
+            output.seek(0)
+            return f"✅ 合成成功 ({count}帧)", output
 
         except Exception as e:
             return f"合成出错: {repr(e)}", None

@@ -21,6 +21,7 @@
 
 import asyncio
 import io
+import json
 import os
 import re
 import tempfile
@@ -51,6 +52,9 @@ from .services.config_service import ConfigService
 from .core.image_handler import ImageHandler
 from .utils.message_utils import MessageUtils
 from .utils.gif_writer import write_gif_streaming
+
+# 合并转发(Forward)解析的最大递归深度，避免异常数据导致无限拉取
+MAX_FORWARD_DEPTH = 5
 
 
 class ImgToolboxPlugin(Star):
@@ -175,41 +179,123 @@ class ImgToolboxPlugin(Star):
         return None
 
     # --- 递归提取所有图片 (支持合并转发、回复等) ---
-    def _extract_images_from_chain(self, chain: list) -> list[str]:
+    @staticmethod
+    def _image_url_from_component(item) -> str:
+        """按可靠性顺序取出 Image 组件的可用地址 (url -> file -> path)。"""
+        for attr in ("url", "file", "path"):
+            value = getattr(item, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    async def _call_get_forward_msg(self, event: AstrMessageEvent, forward_id: str):
+        """调用 OneBot get_forward_msg 拉取合并转发内容，兼容 message_id/id 两种参数名。"""
+        api = getattr(getattr(event, "bot", None), "api", None)
+        call_action = getattr(api, "call_action", None)
+        if not callable(call_action):
+            return None
+        for params in ({"message_id": forward_id}, {"id": forward_id}):
+            try:
+                res = await call_action("get_forward_msg", **params)
+            except Exception as e:
+                logger.debug(f"get_forward_msg 失败 ({params}): {e}")
+                continue
+            if isinstance(res, dict):
+                return res
+        return None
+
+    @staticmethod
+    def _unwrap_forward_nodes(payload: dict) -> list:
+        """从 get_forward_msg 返回中取出节点列表，兼容多种字段名。"""
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        nodes = data.get("messages") or data.get("message") or data.get("nodes") or data.get("nodeList")
+        return nodes if isinstance(nodes, list) else []
+
+    async def _extract_forward_images(self, event: AstrMessageEvent, forward_id: str, depth: int) -> list[str]:
+        """拉取合并转发消息并递归提取其中的图片。"""
+        if depth > MAX_FORWARD_DEPTH:
+            logger.warning("合并转发嵌套层级过深，已停止解析")
+            return []
+        payload = await self._call_get_forward_msg(event, forward_id)
+        if not payload:
+            logger.warning(f"无法获取合并转发内容: {forward_id}")
+            return []
         urls = []
+        for node in self._unwrap_forward_nodes(payload):
+            if not isinstance(node, dict):
+                continue
+            node_data = node.get("data") if isinstance(node.get("data"), dict) else node
+            content = node_data.get("message") or node_data.get("content")
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except (ValueError, TypeError):
+                    content = None
+            if isinstance(content, list):
+                urls.extend(await self._extract_images_from_chain(content, event, depth))
+        return urls
+
+    async def _extract_images_from_chain(self, chain: list, event: AstrMessageEvent, depth: int = 0) -> list[str]:
+        """递归提取消息链中的图片链接，支持合并转发(Forward)、节点(Nodes/Node)与回复链。"""
+        urls = []
+        if not isinstance(chain, list) or depth > MAX_FORWARD_DEPTH:
+            return urls
         for item in chain:
-            if isinstance(item, Comp.Image) and item.url:
-                urls.append(item.url)
-            elif isinstance(item, dict):
-                if item.get('type') == 'image':
-                    url = item.get('data', {}).get('url') or item.get('url') or item.get('file')
-                    if url and isinstance(url, str) and url.startswith('http'):
-                        urls.append(url)
-                elif item.get('type') == 'node':
-                    content = item.get('data', {}).get('content') or item.get('content')
-                    if isinstance(content, list):
-                        urls.extend(self._extract_images_from_chain(content))
-            elif isinstance(item, Comp.Reply) and item.chain:
-                urls.extend(self._extract_images_from_chain(item.chain))
+            if isinstance(item, Comp.Image):
+                url = self._image_url_from_component(item)
+                if url:
+                    urls.append(url)
+            elif isinstance(item, Comp.Forward):
+                forward_id = getattr(item, "id", None)
+                if forward_id:
+                    urls.extend(await self._extract_forward_images(event, str(forward_id), depth + 1))
+            elif isinstance(item, Comp.Node):
+                urls.extend(await self._extract_images_from_chain(getattr(item, "content", None), event, depth + 1))
             elif isinstance(item, Comp.Nodes):
-                if item.nodes:
-                    for node in item.nodes:
-                        if isinstance(node.content, list):
-                            urls.extend(self._extract_images_from_chain(node.content))
+                for node in getattr(item, "nodes", None) or []:
+                    urls.extend(await self._extract_images_from_chain(getattr(node, "content", None), event, depth + 1))
+            elif isinstance(item, Comp.Reply):
+                urls.extend(await self._extract_images_from_chain(getattr(item, "chain", None), event, depth + 1))
+            elif isinstance(item, dict):
+                urls.extend(await self._extract_images_from_dict(item, event, depth))
+        return urls
+
+    async def _extract_images_from_dict(self, item: dict, event: AstrMessageEvent, depth: int) -> list[str]:
+        """处理字典形式的原始消息段 (部分适配器不转换为组件对象)。"""
+        urls = []
+        seg_type = item.get("type")
+        data = item.get("data") if isinstance(item.get("data"), dict) else item
+        if seg_type == "image":
+            url = data.get("url") or data.get("file") or data.get("path")
+            if isinstance(url, str) and url.strip():
+                urls.append(url.strip())
+        elif seg_type in ("forward", "forward_msg", "nodes"):
+            forward_id = data.get("id") or data.get("message_id")
+            if forward_id:
+                urls.extend(await self._extract_forward_images(event, str(forward_id), depth + 1))
+            else:
+                for node in data.get("content") or data.get("messages") or []:
+                    if isinstance(node, dict):
+                        content = node.get("content") or node.get("message")
+                        urls.extend(await self._extract_images_from_chain(content, event, depth + 1))
+        elif seg_type in ("node", "reply"):
+            content = data.get("content") or data.get("message") or data.get("chain")
+            urls.extend(await self._extract_images_from_chain(content, event, depth + 1))
         return urls
 
     async def _get_all_image_urls(self, event: AstrMessageEvent) -> list[str]:
-        """获取上下文中所有的图片链接（包括当前消息、回复的消息、转发消息、At头像）"""
+        """获取上下文中所有的图片链接（包括当前消息、回复的消息、合并转发、At头像）"""
         urls = []
 
         if hasattr(event.message_obj, "message") and isinstance(event.message_obj.message, list):
-            urls.extend(self._extract_images_from_chain(event.message_obj.message))
+            urls.extend(await self._extract_images_from_chain(event.message_obj.message, event))
 
         if hasattr(event, "get_images"):
             imgs = event.get_images()
             for img in imgs:
-                if img.url and img.url not in urls:
-                    urls.append(img.url)
+                url = self._image_url_from_component(img)
+                if url and url not in urls:
+                    urls.append(url)
 
         if hasattr(event.message_obj, "message"):
             for seg in event.message_obj.message:
